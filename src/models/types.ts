@@ -30,6 +30,7 @@ export interface Alert {
   deviceId: string;
   ip: string;
   caseId?: string;
+  version: number;
 }
 
 export interface GraphNodeData {
@@ -100,6 +101,7 @@ export interface InvestigationCase {
   summary: string;
   alertIds: string[];
   nextReviewAt: string;
+  version: number;
 }
 
 export interface AuditLog {
@@ -134,4 +136,50 @@ export interface DashboardSummary {
   totalExposure: number;
   caseStatusCounts: Record<CaseStatus, number>;
   riskCounts: Record<RiskLevel, number>;
+}
+
+export type TriageOperationKind =
+  | "link_alert"
+  | "dismiss_alert"
+  | "register_evidence";
+
+export interface TriageEvidenceDraft {
+  title: string;
+  source: string;
+  strength: EvidenceStrength;
+  occurredAt: string;
+  attachment: string;
+  note: string;
+}
+
+export interface TriageOperation {
+  id: string;
+  kind: TriageOperationKind;
+  alertId?: string;
+  caseId?: string;
+  baseAlertVersion?: number;
+  baseCaseVersion?: number;
+  evidenceDraft?: TriageEvidenceDraft;
+}
+
+export type TriageBatchStatus = "draft" | "pending_retry" | "conflict";
+
+export interface TriageConflictItem {
+  operationId: string;
+  target: "alert" | "case";
+  targetId: string;
+  expectedVersion: number;
+  currentVersion: number;
+  currentSummary: string;
+}
+
+export interface TriageBatch {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: string;
+  status: TriageBatchStatus;
+  operations: TriageOperation[];
+  conflicts: TriageConflictItem[];
+  lastError?: string;
 }

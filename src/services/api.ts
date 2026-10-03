@@ -11,6 +11,8 @@ import type {
   InvestigationCase,
   InvestigationNode,
   RiskLevel,
+  TriageBatch,
+  TriageConflictItem,
 } from "../models/types";
 import {
   appendAudit,
@@ -20,6 +22,12 @@ import {
   resetDatabase,
   writeDatabase,
 } from "./mockStorage";
+import {
+  readTriageBatches,
+  removeTriageBatch,
+  upsertTriageBatch,
+} from "./triageStorage";
+import { commitTriageBatchToDatabase } from "./triageTransaction";
 
 const wait = (milliseconds = 260) =>
   new Promise((resolve) => window.setTimeout(resolve, milliseconds));
@@ -36,10 +44,43 @@ export interface AddNodeInput {
   };
 }
 
+export type CommitBatchResult =
+  | { status: "committed"; batchId: string }
+  | { status: "conflict"; batchId: string; conflicts: TriageConflictItem[] }
+  | { status: "pending_retry"; batchId: string; message: string }
+  | { status: "discarded"; batchId: string };
+
+// 事务结果统一回写到批次存储：成功移除批次，冲突/失败整批保留等待处理。
+const finalizeCommit = (
+  batch: TriageBatch,
+  outcome: ReturnType<typeof commitTriageBatchToDatabase>,
+): CommitBatchResult => {
+  if (outcome.ok) {
+    removeTriageBatch(batch.id);
+    return { status: "committed", batchId: batch.id };
+  }
+  if (outcome.reason === "conflict") {
+    upsertTriageBatch({
+      ...batch,
+      status: "conflict",
+      conflicts: outcome.conflicts,
+      updatedAt: nowIso(),
+    });
+    return { status: "conflict", batchId: batch.id, conflicts: outcome.conflicts };
+  }
+  upsertTriageBatch({
+    ...batch,
+    status: "pending_retry",
+    lastError: outcome.message,
+    updatedAt: nowIso(),
+  });
+  return { status: "pending_retry", batchId: batch.id, message: outcome.message };
+};
+
 export const bankApi = createApi({
   reducerPath: "bankApi",
   baseQuery: fakeBaseQuery(),
-  tagTypes: ["Alerts", "Cases", "Case", "Audit", "Dashboard"],
+  tagTypes: ["Alerts", "Cases", "Case", "Audit", "Dashboard", "TriageBatches"],
   endpoints: (builder) => ({
     getDashboard: builder.query<DashboardSummary, void>({
       queryFn: async () => {
@@ -174,61 +215,86 @@ export const bankApi = createApi({
       },
       providesTags: ["Audit"],
     }),
-    linkAlertsToCase: builder.mutation<
-      Alert[],
-      { alertIds: string[]; caseId: string }
-    >({
-      queryFn: async ({ alertIds, caseId }) => {
-        await wait();
-        const database = readDatabase();
-        const targetCase = database.cases.find((item) => item.id === caseId);
-        if (!targetCase) {
-          return { error: { status: "CUSTOM_ERROR", error: "案件不存在" } };
-        }
-        const updated = database.alerts.map((item) =>
-          alertIds.includes(item.id)
-            ? { ...item, caseId, status: "linked" as const }
-            : item,
-        );
-        const selected = updated.filter((item) => alertIds.includes(item.id));
-        targetCase.alertIds = Array.from(
-          new Set([...targetCase.alertIds, ...alertIds]),
-        );
-        targetCase.updatedAt = nowIso();
-        database.alerts = updated;
-        appendAudit(database, {
-          caseId,
-          actor: "林澜",
-          action: "批量关联告警",
-          detail: `关联告警 ${alertIds.join("、")}。`,
-        });
-        writeDatabase(database);
-        return { data: selected };
+    getTriageBatches: builder.query<TriageBatch[], void>({
+      queryFn: async () => {
+        return { data: readTriageBatches() };
       },
-      invalidatesTags: ["Alerts", "Cases", "Audit", "Dashboard"],
+      providesTags: ["TriageBatches"],
     }),
-    updateAlertStatus: builder.mutation<
-      Alert,
-      { alertId: string; status: Alert["status"] }
-    >({
-      queryFn: async ({ alertId, status }) => {
-        await wait();
-        const database = readDatabase();
-        const alert = database.alerts.find((item) => item.id === alertId);
-        if (!alert) {
-          return { error: { status: "CUSTOM_ERROR", error: "告警不存在" } };
-        }
-        alert.status = status;
-        appendAudit(database, {
-          caseId: alert.caseId,
-          actor: "林澜",
-          action: "更新告警状态",
-          detail: `${alert.id} 状态更新为 ${status}。`,
-        });
-        writeDatabase(database);
-        return { data: alert };
+    saveTriageDraft: builder.mutation<TriageBatch, TriageBatch>({
+      queryFn: async (batch) => {
+        upsertTriageBatch(batch);
+        return { data: batch };
       },
-      invalidatesTags: ["Alerts", "Case", "Audit", "Dashboard"],
+      invalidatesTags: ["TriageBatches"],
+    }),
+    commitTriageBatch: builder.mutation<
+      CommitBatchResult,
+      { batchId: string; simulateFailure?: boolean }
+    >({
+      queryFn: async ({ batchId, simulateFailure }) => {
+        await wait();
+        const batch = readTriageBatches().find((item) => item.id === batchId);
+        if (!batch) {
+          return {
+            error: { status: "CUSTOM_ERROR", error: "批次不存在或已被处理。" },
+          };
+        }
+        if (batch.operations.length === 0) {
+          return {
+            error: { status: "CUSTOM_ERROR", error: "批次内没有可提交的操作。" },
+          };
+        }
+        const outcome = commitTriageBatchToDatabase(batch, {
+          failWrite: simulateFailure,
+        });
+        return { data: finalizeCommit(batch, outcome) };
+      },
+      invalidatesTags: [
+        "TriageBatches",
+        "Alerts",
+        "Cases",
+        "Case",
+        "Audit",
+        "Dashboard",
+      ],
+    }),
+    resolveTriageConflict: builder.mutation<
+      CommitBatchResult,
+      { batchId: string; resolution: "keep_mine" | "keep_theirs" }
+    >({
+      queryFn: async ({ batchId, resolution }) => {
+        await wait();
+        const batch = readTriageBatches().find((item) => item.id === batchId);
+        if (!batch) {
+          return {
+            error: { status: "CUSTOM_ERROR", error: "批次不存在或已被处理。" },
+          };
+        }
+        // 保留线上版本：放弃本批次，不写库也不产生审计。
+        if (resolution === "keep_theirs") {
+          removeTriageBatch(batchId);
+          return { data: { status: "discarded", batchId } };
+        }
+        // 保留本批次：以批次内容为准强制入库，审计只记录这次实际入库。
+        const outcome = commitTriageBatchToDatabase(batch, { force: true });
+        return { data: finalizeCommit(batch, outcome) };
+      },
+      invalidatesTags: [
+        "TriageBatches",
+        "Alerts",
+        "Cases",
+        "Case",
+        "Audit",
+        "Dashboard",
+      ],
+    }),
+    discardTriageBatch: builder.mutation<{ id: string }, string>({
+      queryFn: async (batchId) => {
+        removeTriageBatch(batchId);
+        return { data: { id: batchId } };
+      },
+      invalidatesTags: ["TriageBatches"],
     }),
     addGraphNode: builder.mutation<
       InvestigationNode,
@@ -257,6 +323,7 @@ export const bankApi = createApi({
         const targetCase = database.cases.find((item) => item.id === caseId);
         if (targetCase) {
           targetCase.updatedAt = nowIso();
+          targetCase.version += 1;
         }
         appendAudit(database, {
           caseId,
@@ -312,6 +379,7 @@ export const bankApi = createApi({
         );
         if (targetCase) {
           targetCase.updatedAt = nowIso();
+          targetCase.version += 1;
         }
         appendAudit(database, {
           caseId: input.caseId,
@@ -364,6 +432,7 @@ export const bankApi = createApi({
         if (targetCase) {
           targetCase.status = input.submit ? "pending_review" : "investigating";
           targetCase.updatedAt = nowIso();
+          targetCase.version += 1;
         }
         appendAudit(database, {
           caseId: input.caseId,
@@ -408,6 +477,7 @@ export const bankApi = createApi({
         }
         targetCase.status = status;
         targetCase.updatedAt = nowIso();
+        targetCase.version += 1;
         appendAudit(database, {
           caseId,
           actor: "林澜",
@@ -460,6 +530,7 @@ export const bankApi = createApi({
           targetCase.status =
             decision === "approve" ? "closed" : "supplement";
           targetCase.updatedAt = nowIso();
+          targetCase.version += 1;
         }
         appendAudit(database, {
           caseId,
@@ -491,17 +562,20 @@ export const bankApi = createApi({
 export const {
   useAddEvidenceMutation,
   useAddGraphNodeMutation,
+  useCommitTriageBatchMutation,
+  useDiscardTriageBatchMutation,
   useGetAlertsQuery,
   useGetAuditLogsQuery,
   useGetCaseWorkspaceQuery,
   useGetCasesQuery,
   useGetDashboardQuery,
-  useLinkAlertsToCaseMutation,
+  useGetTriageBatchesQuery,
   useResetMockDataMutation,
+  useResolveTriageConflictMutation,
   useReviewConclusionMutation,
   useSaveConclusionMutation,
+  useSaveTriageDraftMutation,
   useTransitionCaseMutation,
-  useUpdateAlertStatusMutation,
   useUpdateGraphNodeMutation,
 } = bankApi;
 

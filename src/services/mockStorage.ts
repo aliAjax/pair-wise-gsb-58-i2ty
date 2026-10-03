@@ -27,7 +27,7 @@ export interface MockDatabase {
   auditLogs: AuditLog[];
 }
 
-const STORAGE_KEY = "bank-fraud-investigation-db-v1";
+export const STORAGE_KEY = "bank-fraud-investigation-db-v1";
 
 const createSeedDatabase = (): MockDatabase => ({
   alerts: structuredClone(seedAlerts),
@@ -38,6 +38,19 @@ const createSeedDatabase = (): MockDatabase => ({
   conclusions: structuredClone(seedConclusions),
   auditLogs: structuredClone(seedAuditLogs),
 });
+
+// 旧版本本地数据缺少乐观锁版本号，读取时补齐，避免刷新后丢失可恢复性。
+const normalizeDatabase = (database: MockDatabase): MockDatabase => {
+  database.alerts = database.alerts.map((item) => ({
+    ...item,
+    version: typeof item.version === "number" ? item.version : 1,
+  }));
+  database.cases = database.cases.map((item) => ({
+    ...item,
+    version: typeof item.version === "number" ? item.version : 1,
+  }));
+  return database;
+};
 
 export const readDatabase = (): MockDatabase => {
   if (typeof window === "undefined") {
@@ -52,7 +65,7 @@ export const readDatabase = (): MockDatabase => {
   }
 
   try {
-    return JSON.parse(stored) as MockDatabase;
+    return normalizeDatabase(JSON.parse(stored) as MockDatabase);
   } catch {
     const seeded = createSeedDatabase();
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(seeded));

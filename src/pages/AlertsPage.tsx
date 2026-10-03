@@ -1,4 +1,5 @@
 import {
+  Alert,
   Button,
   Checkbox,
   Group,
@@ -15,11 +16,12 @@ import {
 import { notifications } from "@mantine/notifications";
 import {
   EyeOff,
+  History,
   Link2,
   RotateCcw,
   Search,
 } from "lucide-react";
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   AlertStatusBadge,
@@ -32,12 +34,17 @@ import {
   setAlertSelection,
   setCaseTargetId,
 } from "../features/alerts/alertsSlice";
+import { TriageBatchPanel } from "../features/alerts/TriageBatchPanel";
+import type { TriageBatch, TriageOperation } from "../models/types";
 import {
   useGetAlertsQuery,
   useGetCasesQuery,
-  useLinkAlertsToCaseMutation,
-  useUpdateAlertStatusMutation,
+  useGetTriageBatchesQuery,
+  useSaveTriageDraftMutation,
 } from "../services/api";
+import { createId, nowIso } from "../services/mockStorage";
+
+const CURRENT_ACTOR = "林澜";
 
 export function AlertsPage() {
   const dispatch = useAppDispatch();
@@ -49,8 +56,14 @@ export function AlertsPage() {
   const caseTargetId = useAppSelector((state) => state.alertsUi.caseTargetId);
   const { data: alerts = [], isFetching } = useGetAlertsQuery(filters);
   const { data: cases = [] } = useGetCasesQuery();
-  const [linkAlerts, { isLoading: isLinking }] = useLinkAlertsToCaseMutation();
-  const [updateStatus] = useUpdateAlertStatusMutation();
+  const { data: batches = [] } = useGetTriageBatchesQuery();
+  const [saveDraft] = useSaveTriageDraftMutation();
+  const batchPanelRef = useRef<HTMLDivElement>(null);
+
+  const recoverableBatches = batches.filter(
+    (item) =>
+      item.status !== "draft" || item.operations.length > 0,
+  );
 
   const allCurrentSelected =
     alerts.length > 0 && alerts.every((item) => selectedIds.includes(item.id));
@@ -64,50 +77,87 @@ export function AlertsPage() {
     [alerts],
   );
 
-  const handleLink = async () => {
-    if (selectedIds.length === 0 || !caseTargetId) {
+  // 把勾选结果登记进本地草稿批次：每条操作都记录提交前看到的版本号，
+  // 提交事务时逐条核对，版本不一致整批拒绝并标记冲突。
+  const stageOperations = async (kind: "link_alert" | "dismiss_alert") => {
+    if (selectedIds.length === 0) {
       notifications.show({
         color: "red",
-        title: "无法关联",
-        message: "请选择至少一条告警和目标案件。",
+        title: "无法加入批次",
+        message: "请先勾选至少一条告警。",
       });
       return;
     }
-    try {
-      const result = await linkAlerts({
-        alertIds: selectedIds,
-        caseId: caseTargetId,
-      }).unwrap();
+    const targetCase = cases.find((item) => item.id === caseTargetId);
+    if (kind === "link_alert" && !targetCase) {
       notifications.show({
-        color: "teal",
-        title: "关联完成",
-        message: `${result.length} 条告警已加入 ${caseTargetId}。`,
+        color: "red",
+        title: "无法加入批次",
+        message: "请选择目标案件。",
       });
-      dispatch(setAlertSelection([]));
-    } catch (error) {
-      const message =
-        typeof error === "object" && error && "error" in error
-          ? String(error.error)
-          : "关联失败，请重试。";
-      notifications.show({ color: "red", title: "关联失败", message });
-    }
-  };
-
-  const handleDismiss = async () => {
-    if (selectedIds.length === 0) {
       return;
     }
-    await Promise.all(
-      selectedIds.map((alertId) =>
-        updateStatus({ alertId, status: "dismissed" }).unwrap(),
-      ),
-    );
-    notifications.show({
-      color: "gray",
-      title: "已排除",
-      message: `${selectedIds.length} 条告警已标记为已排除并写入审计。`,
-    });
-    dispatch(setAlertSelection([]));
+
+    const operations: TriageOperation[] = [];
+    for (const alertId of selectedIds) {
+      const alert = alerts.find((item) => item.id === alertId);
+      if (!alert) {
+        continue;
+      }
+      operations.push({
+        id: createId("OP"),
+        kind,
+        alertId,
+        caseId: kind === "link_alert" ? caseTargetId : undefined,
+        baseAlertVersion: alert.version,
+        baseCaseVersion:
+          kind === "link_alert" ? targetCase?.version : undefined,
+      });
+    }
+    if (operations.length === 0) {
+      return;
+    }
+
+    const draft = batches.find((item) => item.status === "draft");
+    const base: TriageBatch =
+      draft ?? {
+        id: createId("BATCH"),
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+        createdBy: CURRENT_ACTOR,
+        status: "draft",
+        operations: [],
+        conflicts: [],
+      };
+    // 同一告警只保留最新一次登记，避免批次内出现相互覆盖的操作。
+    const stagedAlertIds = new Set(operations.map((item) => item.alertId));
+    const next: TriageBatch = {
+      ...base,
+      operations: [
+        ...base.operations.filter((item) => !stagedAlertIds.has(item.alertId)),
+        ...operations,
+      ],
+      updatedAt: nowIso(),
+    };
+    try {
+      await saveDraft(next).unwrap();
+      dispatch(setAlertSelection([]));
+      notifications.show({
+        color: "blue",
+        title: "已加入本地批次",
+        message: `${operations.length} 条操作已记录提交前版本号，提交批次后才会入库。`,
+      });
+      batchPanelRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "nearest",
+      });
+    } catch {
+      notifications.show({
+        color: "red",
+        title: "批次保存失败",
+        message: "本地批次写入失败，请重试。",
+      });
+    }
   };
 
   return (
@@ -116,13 +166,36 @@ export function AlertsPage() {
         <div>
           <Title order={2}>告警中心</Title>
           <Text c="dimmed" size="sm" mt={4}>
-            对账户、设备、IP 和交易线索进行组合筛选，再批量加入案件。
+            对账户、设备、IP 和交易线索进行组合筛选，分诊操作先进入本地批次再统一入库。
           </Text>
         </div>
         <Text size="sm" c="dimmed">
           {isFetching ? "正在刷新本地服务..." : `共 ${alerts.length} 条结果`}
         </Text>
       </Group>
+
+      {recoverableBatches.length > 0 ? (
+        <Alert
+          color="blue"
+          icon={<History size={16} />}
+          title={`已从本地恢复 ${recoverableBatches.length} 个未入库批次`}
+        >
+          <Group justify="space-between" align="center">
+            <Text size="sm">
+              包含草稿、待重试或冲突批次，提交或处理前不会改动告警、案件与审计。
+            </Text>
+            <Button
+              size="compact-xs"
+              variant="light"
+              onClick={() =>
+                batchPanelRef.current?.scrollIntoView({ behavior: "smooth" })
+              }
+            >
+              继续处理
+            </Button>
+          </Group>
+        </Alert>
+      ) : null}
 
       <Paper withBorder p="md">
         <Group align="flex-end" grow>
@@ -191,6 +264,10 @@ export function AlertsPage() {
         </Group>
       </Paper>
 
+      <div ref={batchPanelRef}>
+        <TriageBatchPanel />
+      </div>
+
       <Paper withBorder>
         <Group justify="space-between" p="md">
           <Text size="sm" fw={600}>
@@ -209,19 +286,18 @@ export function AlertsPage() {
             />
             <Button
               leftSection={<Link2 size={16} />}
-              onClick={handleLink}
-              loading={isLinking}
+              onClick={() => void stageOperations("link_alert")}
             >
-              关联到案件
+              加入关联批次
             </Button>
             <Button
               variant="light"
               color="gray"
               leftSection={<EyeOff size={16} />}
               disabled={selectedIds.length === 0}
-              onClick={handleDismiss}
+              onClick={() => void stageOperations("dismiss_alert")}
             >
-              批量排除
+              排除加入批次
             </Button>
           </Group>
         </Group>
@@ -316,7 +392,12 @@ export function AlertsPage() {
                     </Stack>
                   </Table.Td>
                   <Table.Td>
-                    <AlertStatusBadge value={alert.status} />
+                    <Stack gap={4}>
+                      <AlertStatusBadge value={alert.status} />
+                      <Text size="xs" c="dimmed">
+                        版本 v{alert.version}
+                      </Text>
+                    </Stack>
                   </Table.Td>
                   <Table.Td>
                     <Text size="xs">
