@@ -24,6 +24,7 @@ export const seedAlerts: Alert[] = [
     deviceId: "DV-A91F",
     ip: "117.136.40.17",
     caseId: "CASE-2026-017",
+    version: 1,
   },
   {
     id: "AL-20260929-002",
@@ -40,6 +41,7 @@ export const seedAlerts: Alert[] = [
     deviceId: "DV-A91F",
     ip: "117.136.40.17",
     caseId: "CASE-2026-017",
+    version: 1,
   },
   {
     id: "AL-20260928-014",
@@ -55,6 +57,7 @@ export const seedAlerts: Alert[] = [
     tags: ["高风险名单"],
     deviceId: "DV-C110",
     ip: "183.14.30.22",
+    version: 1,
   },
   {
     id: "AL-20260928-009",
@@ -71,6 +74,7 @@ export const seedAlerts: Alert[] = [
     deviceId: "DV-E204",
     ip: "117.136.40.17",
     caseId: "CASE-2026-017",
+    version: 1,
   },
   {
     id: "AL-20260927-021",
@@ -86,6 +90,7 @@ export const seedAlerts: Alert[] = [
     tags: ["高频小额"],
     deviceId: "DV-H812",
     ip: "120.232.12.8",
+    version: 1,
   },
   {
     id: "AL-20260927-012",
@@ -102,6 +107,7 @@ export const seedAlerts: Alert[] = [
     deviceId: "ATM-SH-307",
     ip: "221.5.80.12",
     caseId: "CASE-2026-016",
+    version: 1,
   },
   {
     id: "AL-20260926-032",
@@ -117,6 +123,7 @@ export const seedAlerts: Alert[] = [
     tags: ["路径变化"],
     deviceId: "DV-CORP-42",
     ip: "61.140.9.81",
+    version: 1,
   },
   {
     id: "AL-20260925-018",
@@ -133,6 +140,7 @@ export const seedAlerts: Alert[] = [
     deviceId: "DV-A91F",
     ip: "117.136.40.17",
     caseId: "CASE-2026-015",
+    version: 1,
   },
 ];
 
@@ -148,6 +156,7 @@ export const seedCases: InvestigationCase[] = [
     summary: "三名账户持有人在短时间内共享设备与 IP，资金呈现快进快出。",
     alertIds: ["AL-20260929-001", "AL-20260929-002", "AL-20260928-009"],
     nextReviewAt: "2026-09-29T16:00:00+08:00",
+    version: 1,
   },
   {
     id: "CASE-2026-016",
@@ -160,6 +169,7 @@ export const seedCases: InvestigationCase[] = [
     summary: "开户后的十二小时内发生多地点 ATM 提现，待复核关联程度。",
     alertIds: ["AL-20260927-012"],
     nextReviewAt: "2026-09-29T11:30:00+08:00",
+    version: 1,
   },
   {
     id: "CASE-2026-015",
@@ -172,6 +182,7 @@ export const seedCases: InvestigationCase[] = [
     summary: "受益账户与多个已关闭案件存在交易交集，需要补充交易用途材料。",
     alertIds: ["AL-20260925-018"],
     nextReviewAt: "2026-09-30T10:00:00+08:00",
+    version: 1,
   },
 ];
 

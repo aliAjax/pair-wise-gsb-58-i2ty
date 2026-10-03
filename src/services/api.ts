@@ -11,9 +11,24 @@ import type {
   InvestigationCase,
   InvestigationNode,
   RiskLevel,
+  TriageBatch,
+  TriageEvidenceDraft,
 } from "../models/types";
+import { commitTriageBatch } from "../features/triage/triageEngine";
+import {
+  appendToBatch,
+  createTriageBatch,
+  discardBatch,
+  getBatch,
+  refreshBatchSnapshots,
+  removeBatchAction,
+  setActiveBatch,
+  setBatchResolution,
+  updateBatchEvidence,
+} from "../features/triage/triageStore";
 import {
   appendAudit,
+  armNextCommitFailure,
   createId,
   nowIso,
   readDatabase,
@@ -174,61 +189,141 @@ export const bankApi = createApi({
       },
       providesTags: ["Audit"],
     }),
-    linkAlertsToCase: builder.mutation<
-      Alert[],
-      { alertIds: string[]; caseId: string }
+    stageTriageBatch: builder.mutation<
+      TriageBatch,
+      {
+        batchId?: string;
+        caseId: string;
+        alertIds: string[];
+        kind: "link" | "dismiss";
+        evidenceDraft?: TriageEvidenceDraft;
+      }
     >({
-      queryFn: async ({ alertIds, caseId }) => {
-        await wait();
+      queryFn: async (input) => {
+        await wait(120);
         const database = readDatabase();
-        const targetCase = database.cases.find((item) => item.id === caseId);
-        if (!targetCase) {
-          return { error: { status: "CUSTOM_ERROR", error: "案件不存在" } };
+        const alerts = database.alerts.filter((item) =>
+          input.alertIds.includes(item.id),
+        );
+        if (alerts.length === 0) {
+          return {
+            error: { status: "CUSTOM_ERROR", error: "请选择至少一条告警。" },
+          };
         }
-        const updated = database.alerts.map((item) =>
-          alertIds.includes(item.id)
-            ? { ...item, caseId, status: "linked" as const }
-            : item,
-        );
-        const selected = updated.filter((item) => alertIds.includes(item.id));
-        targetCase.alertIds = Array.from(
-          new Set([...targetCase.alertIds, ...alertIds]),
-        );
-        targetCase.updatedAt = nowIso();
-        database.alerts = updated;
-        appendAudit(database, {
-          caseId,
-          actor: "林澜",
-          action: "批量关联告警",
-          detail: `关联告警 ${alertIds.join("、")}。`,
-        });
-        writeDatabase(database);
-        return { data: selected };
+        try {
+          const batch = input.batchId
+            ? appendToBatch(
+                input.batchId,
+                alerts,
+                input.kind,
+                input.evidenceDraft,
+              )
+            : createTriageBatch({
+                caseId: input.caseId,
+                alerts,
+                kind: input.kind,
+                evidenceDraft: input.evidenceDraft,
+              });
+          return { data: batch };
+        } catch (error) {
+          return {
+            error: {
+              status: "CUSTOM_ERROR",
+              error: error instanceof Error ? error.message : "暂存失败",
+            },
+          };
+        }
       },
-      invalidatesTags: ["Alerts", "Cases", "Audit", "Dashboard"],
     }),
-    updateAlertStatus: builder.mutation<
-      Alert,
-      { alertId: string; status: Alert["status"] }
+    commitTriageBatch: builder.mutation<
+      { status: "committed" | "conflict" | "failed"; batch: TriageBatch },
+      string
     >({
-      queryFn: async ({ alertId, status }) => {
-        await wait();
-        const database = readDatabase();
-        const alert = database.alerts.find((item) => item.id === alertId);
-        if (!alert) {
-          return { error: { status: "CUSTOM_ERROR", error: "告警不存在" } };
+      queryFn: async (batchId) => {
+        await wait(320);
+        try {
+          const result = commitTriageBatch(batchId);
+          if (result.status === "committed") {
+            return { data: result };
+          }
+          // 冲突或写入失败都不是网络错误：业务库未被部分写入
+          return { data: result };
+        } catch (error) {
+          return {
+            error: {
+              status: "CUSTOM_ERROR",
+              error: error instanceof Error ? error.message : "提交失败",
+            },
+          };
         }
-        alert.status = status;
-        appendAudit(database, {
-          caseId: alert.caseId,
-          actor: "林澜",
-          action: "更新告警状态",
-          detail: `${alert.id} 状态更新为 ${status}。`,
-        });
-        writeDatabase(database);
-        return { data: alert };
       },
-      invalidatesTags: ["Alerts", "Case", "Audit", "Dashboard"],
+      invalidatesTags: ["Alerts", "Cases", "Case", "Audit", "Dashboard"],
+    }),
+    resolveTriageConflict: builder.mutation<
+      TriageBatch,
+      { batchId: string; conflictKey: string; choice: "mine" | "theirs" }
+    >({
+      queryFn: async ({ batchId, conflictKey, choice }) => {
+        await wait(60);
+        setBatchResolution(batchId, conflictKey, choice);
+        const updated = getBatch(batchId);
+        if (!updated) {
+          return {
+            error: { status: "CUSTOM_ERROR", error: "分诊批次不存在" },
+          };
+        }
+        return { data: updated };
+      },
+    }),
+    adoptTriageSnapshot: builder.mutation<TriageBatch, string>({
+      queryFn: async (batchId) => {
+        await wait(80);
+        refreshBatchSnapshots(batchId);
+        const updated = getBatch(batchId);
+        if (!updated) {
+          return {
+            error: { status: "CUSTOM_ERROR", error: "分诊批次不存在" },
+          };
+        }
+        return { data: updated };
+      },
+    }),
+    updateTriageEvidence: builder.mutation<
+      void,
+      { batchId: string; draft?: TriageEvidenceDraft }
+    >({
+      queryFn: async ({ batchId, draft }) => {
+        await wait(40);
+        updateBatchEvidence(batchId, draft);
+        return { data: undefined };
+      },
+    }),
+    removeTriageAction: builder.mutation<void, { batchId: string; alertId: string }>({
+      queryFn: async ({ batchId, alertId }) => {
+        await wait(40);
+        removeBatchAction(batchId, alertId);
+        return { data: undefined };
+      },
+    }),
+    discardTriageBatch: builder.mutation<void, string>({
+      queryFn: async (batchId) => {
+        await wait(60);
+        discardBatch(batchId);
+        return { data: undefined };
+      },
+      invalidatesTags: ["Alerts", "Cases"],
+    }),
+    activateTriageBatch: builder.mutation<void, string>({
+      queryFn: async (batchId) => {
+        setActiveBatch(batchId);
+        return { data: undefined };
+      },
+    }),
+    armCommitFailure: builder.mutation<void, void>({
+      queryFn: async () => {
+        armNextCommitFailure();
+        return { data: undefined };
+      },
     }),
     addGraphNode: builder.mutation<
       InvestigationNode,
@@ -257,6 +352,7 @@ export const bankApi = createApi({
         const targetCase = database.cases.find((item) => item.id === caseId);
         if (targetCase) {
           targetCase.updatedAt = nowIso();
+          targetCase.version += 1;
         }
         appendAudit(database, {
           caseId,
@@ -312,6 +408,7 @@ export const bankApi = createApi({
         );
         if (targetCase) {
           targetCase.updatedAt = nowIso();
+          targetCase.version += 1;
         }
         appendAudit(database, {
           caseId: input.caseId,
@@ -364,6 +461,7 @@ export const bankApi = createApi({
         if (targetCase) {
           targetCase.status = input.submit ? "pending_review" : "investigating";
           targetCase.updatedAt = nowIso();
+          targetCase.version += 1;
         }
         appendAudit(database, {
           caseId: input.caseId,
@@ -408,6 +506,7 @@ export const bankApi = createApi({
         }
         targetCase.status = status;
         targetCase.updatedAt = nowIso();
+        targetCase.version += 1;
         appendAudit(database, {
           caseId,
           actor: "林澜",
@@ -460,6 +559,7 @@ export const bankApi = createApi({
           targetCase.status =
             decision === "approve" ? "closed" : "supplement";
           targetCase.updatedAt = nowIso();
+          targetCase.version += 1;
         }
         appendAudit(database, {
           caseId,
@@ -489,20 +589,27 @@ export const bankApi = createApi({
 });
 
 export const {
+  useActivateTriageBatchMutation,
   useAddEvidenceMutation,
   useAddGraphNodeMutation,
+  useAdoptTriageSnapshotMutation,
+  useArmCommitFailureMutation,
+  useCommitTriageBatchMutation,
+  useDiscardTriageBatchMutation,
   useGetAlertsQuery,
   useGetAuditLogsQuery,
   useGetCaseWorkspaceQuery,
   useGetCasesQuery,
   useGetDashboardQuery,
-  useLinkAlertsToCaseMutation,
+  useRemoveTriageActionMutation,
   useResetMockDataMutation,
+  useResolveTriageConflictMutation,
   useReviewConclusionMutation,
   useSaveConclusionMutation,
+  useStageTriageBatchMutation,
   useTransitionCaseMutation,
-  useUpdateAlertStatusMutation,
   useUpdateGraphNodeMutation,
+  useUpdateTriageEvidenceMutation,
 } = bankApi;
 
 export type { RiskLevel };

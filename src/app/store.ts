@@ -14,5 +14,22 @@ export const store = configureStore({
 
 setupListeners(store.dispatch);
 
+// 另一个窗口写入业务库后，本窗口的 RTK Query 缓存即时失效重拉
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (event.key === "bank-fraud-investigation-db-v1") {
+      store.dispatch(
+        bankApi.util.invalidateTags([
+          "Alerts",
+          "Cases",
+          "Case",
+          "Audit",
+          "Dashboard",
+        ]),
+      );
+    }
+  });
+}
+
 export type RootState = ReturnType<typeof store.getState>;
 export type AppDispatch = typeof store.dispatch;
